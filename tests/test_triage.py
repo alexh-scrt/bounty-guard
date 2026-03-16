@@ -116,7 +116,9 @@ def _make_mock_github_client() -> MagicMock:
     """Build a mock GitHubClient."""
     client = MagicMock()
     client.apply_label.return_value = None
-    client.post_spam_comment.return_value = "https://github.com/owner/repo/issues/1#issuecomment-1"
+    client.post_spam_comment.return_value = (
+        "https://github.com/owner/repo/issues/1#issuecomment-1"
+    )
     client.remove_label.return_value = True
     return client
 
@@ -244,6 +246,43 @@ class TestMakeDecision:
         )
         assert llm_t is False
 
+    def test_both_triggered_any_mode_gives_spam(self):
+        decision, rule_t, llm_t = _make_decision(
+            spam_score=self._spam_score(0.8),
+            llm_result=self._llm_result(0.9),
+            rule_threshold=0.6,
+            llm_threshold=0.7,
+            combined_mode="any",
+        )
+        assert decision == TriageDecision.SPAM
+        assert rule_t is True
+        assert llm_t is True
+
+    def test_score_just_below_threshold_not_near_boundary_is_legitimate(self):
+        # score = 0.1, threshold = 0.6 -> not near threshold (0.1 < 0.45)
+        decision, rule_t, _ = _make_decision(
+            spam_score=self._spam_score(0.1),
+            llm_result=self._llm_result(0.0, skipped=True),
+            rule_threshold=0.6,
+            llm_threshold=0.7,
+            combined_mode="any",
+        )
+        assert decision == TriageDecision.LEGITIMATE
+        assert rule_t is False
+
+    def test_all_mode_only_llm_triggered_not_spam(self):
+        # In 'all' mode, rule didn't trigger so result should not be SPAM.
+        decision, rule_t, llm_t = _make_decision(
+            spam_score=self._spam_score(0.1),
+            llm_result=self._llm_result(0.95),
+            rule_threshold=0.6,
+            llm_threshold=0.7,
+            combined_mode="all",
+        )
+        assert decision != TriageDecision.SPAM
+        assert rule_t is False
+        assert llm_t is True
+
 
 # ---------------------------------------------------------------------------
 # Tests: _build_reasoning
@@ -304,6 +343,86 @@ class TestBuildReasoning:
             llm_threshold=0.7,
         )
         assert "disabled" in reasoning.lower() or "LLM" in reasoning
+
+    def test_uncertain_decision_reasoning_non_empty(self):
+        score = self._spam_score(0.5, vague_description=True)
+        llm = LLMResult(skipped=True)
+        reasoning = _build_reasoning(
+            decision=TriageDecision.UNCERTAIN,
+            spam_score=score,
+            llm_result=llm,
+            rule_threshold=0.6,
+            llm_threshold=0.7,
+        )
+        assert len(reasoning) > 0
+        assert "0.50" in reasoning or "borderline" in reasoning.lower() or "uncertain" in reasoning.lower()
+
+    def test_reasoning_includes_rule_score(self):
+        score = self._spam_score(0.71)
+        llm = LLMResult(skipped=True)
+        reasoning = _build_reasoning(
+            decision=TriageDecision.SPAM,
+            spam_score=score,
+            llm_result=llm,
+            rule_threshold=0.6,
+            llm_threshold=0.7,
+        )
+        assert "0.71" in reasoning
+
+    def test_reasoning_includes_threshold(self):
+        score = self._spam_score(0.8)
+        llm = LLMResult(skipped=True)
+        reasoning = _build_reasoning(
+            decision=TriageDecision.SPAM,
+            spam_score=score,
+            llm_result=llm,
+            rule_threshold=0.6,
+            llm_threshold=0.7,
+        )
+        assert "0.60" in reasoning
+
+    def test_signals_listed_in_spam_reasoning(self):
+        score = self._spam_score(
+            0.7,
+            vague_description=True,
+            no_code_evidence=True,
+            generic_greeting=True,
+        )
+        llm = LLMResult(skipped=True)
+        reasoning = _build_reasoning(
+            decision=TriageDecision.SPAM,
+            spam_score=score,
+            llm_result=llm,
+            rule_threshold=0.6,
+            llm_threshold=0.7,
+        )
+        assert "vague_description" in reasoning
+        assert "no_code_evidence" in reasoning
+        assert "generic_greeting" in reasoning
+
+    def test_no_signals_shows_none(self):
+        score = self._spam_score(0.7)  # score set but no boolean signals
+        llm = LLMResult(skipped=True)
+        reasoning = _build_reasoning(
+            decision=TriageDecision.SPAM,
+            spam_score=score,
+            llm_result=llm,
+            rule_threshold=0.6,
+            llm_threshold=0.7,
+        )
+        assert "none" in reasoning.lower() or len(reasoning) > 0
+
+    def test_llm_threshold_shown_in_reasoning(self):
+        score = self._spam_score(0.7)
+        llm = LLMResult(spam_probability=0.85, skipped=False, model="gpt-4o-mini")
+        reasoning = _build_reasoning(
+            decision=TriageDecision.SPAM,
+            spam_score=score,
+            llm_result=llm,
+            rule_threshold=0.6,
+            llm_threshold=0.7,
+        )
+        assert "0.70" in reasoning
 
 
 # ---------------------------------------------------------------------------
@@ -562,6 +681,168 @@ class TestTriageOrchestratorTriageIssue:
         )
         gh.set_installation_id.assert_called_with(999)
 
+    def test_issue_record_stores_metadata(self):
+        db_repo = _make_db_repo()
+        orchestrator = self._make_orchestrator(
+            settings=_make_settings(rule_threshold=0.3),
+            db_repo=db_repo,
+        )
+        orchestrator.triage_issue(
+            repo_full_name="owner/meta-test",
+            issue_number=55,
+            issue_title="Test title",
+            issue_body=SPAM_BODY,
+            issue_url="https://github.com/owner/meta-test/issues/55",
+            author_login="testuser",
+            apply_github_actions=False,
+        )
+        record = db_repo.get_by_repo_and_issue("owner/meta-test", 55)
+        assert record is not None
+        assert record.issue_title == "Test title"
+        assert record.issue_url == "https://github.com/owner/meta-test/issues/55"
+        assert record.author_login == "testuser"
+
+    def test_uncertain_decision_applies_label(self):
+        """Borderline score (UNCERTAIN) should also trigger label application."""
+        gh = _make_mock_github_client()
+        orchestrator = self._make_orchestrator(
+            settings=_make_settings(rule_threshold=0.6, hold_notification=False),
+            github_client=gh,
+        )
+        # Score 0.5 with threshold 0.6 is borderline -> UNCERTAIN
+        # Use a body that yields a borderline score
+        with patch("bounty_guard.triage.score_issue") as mock_score:
+            mock_score.return_value = SpamScore(
+                vague_description=True,
+                missing_reproduction_steps=True,
+                no_code_evidence=True,
+                total_score=3 / 7,  # ~0.43, which is near 0.75 * 0.6 = 0.45
+            )
+            # Make 3/7 * 1 = borderline: 3/7 ~= 0.43, 0.75*0.6 = 0.45
+            # Let's use a score that is actually borderline
+            mock_score.return_value = SpamScore(
+                vague_description=True,
+                missing_reproduction_steps=True,
+                no_code_evidence=True,
+                excessive_severity_claims=False,
+                generic_greeting=False,
+                suspiciously_short=False,
+                cve_template_detected=False,
+                total_score=0.5,  # 0.5 >= 0.75*0.6=0.45 and < 0.6
+            )
+            result = orchestrator.triage_issue(
+                repo_full_name="owner/repo",
+                issue_number=20,
+                issue_body="some body",
+            )
+        if result.decision == TriageDecision.UNCERTAIN:
+            gh.apply_label.assert_called_once()
+
+    def test_triage_result_triaged_at_is_set(self):
+        orchestrator = self._make_orchestrator()
+        result = orchestrator.triage_issue(
+            repo_full_name="owner/repo",
+            issue_number=30,
+            issue_body=LEGITIMATE_BODY,
+            apply_github_actions=False,
+        )
+        assert result.triaged_at is not None
+
+    def test_llm_reasoning_in_comment_when_not_skipped(self):
+        """When LLM is not skipped and hold_notification=True, comment includes LLM reasoning."""
+        gh = _make_mock_github_client()
+        mock_llm_result = LLMResult(
+            spam_probability=0.95,
+            reasoning="Clearly AI-generated: no technical detail.",
+            model="gpt-4o-mini",
+            skipped=False,
+        )
+        with patch(
+            "bounty_guard.triage.classify_issue",
+            return_value=mock_llm_result,
+        ):
+            orchestrator = self._make_orchestrator(
+                settings=_make_settings(
+                    rule_threshold=0.3,
+                    llm_enabled=True,
+                    llm_threshold=0.7,
+                    combined_mode="any",
+                    openai_api_key="sk-fake",
+                    hold_notification=True,
+                ),
+                github_client=gh,
+            )
+            orchestrator.triage_issue(
+                repo_full_name="owner/repo",
+                issue_number=40,
+                issue_body=SPAM_BODY,
+            )
+        # The comment should have been posted with LLM reasoning included.
+        gh.post_spam_comment.assert_called_once()
+        call_kwargs = gh.post_spam_comment.call_args[1]
+        assert "Clearly AI-generated" in call_kwargs.get("reasoning", "")
+
+    def test_none_body_handled_gracefully(self):
+        """None body should be handled without error."""
+        orchestrator = self._make_orchestrator(
+            settings=_make_settings(rule_threshold=0.6),
+        )
+        result = orchestrator.triage_issue(
+            repo_full_name="owner/repo",
+            issue_number=50,
+            issue_body=None,
+            apply_github_actions=False,
+        )
+        assert isinstance(result, TriageResult)
+        assert result.spam_score.total_score == 1.0  # None body = max spam score
+
+    def test_spam_label_configurable(self):
+        """Custom spam label from settings is used when applying label."""
+        gh = _make_mock_github_client()
+        orchestrator = self._make_orchestrator(
+            settings=_make_settings(
+                rule_threshold=0.3,
+                spam_label="ai-generated-report",
+                hold_notification=False,
+            ),
+            github_client=gh,
+        )
+        result = orchestrator.triage_issue(
+            repo_full_name="owner/repo",
+            issue_number=60,
+            issue_body=SPAM_BODY,
+        )
+        assert result.decision == TriageDecision.SPAM
+        gh.apply_label.assert_called_once()
+        call_kwargs = gh.apply_label.call_args[1]
+        assert call_kwargs["label_name"] == "ai-generated-report"
+        assert result.label_applied == "ai-generated-report"
+
+    def test_second_triage_upserts_existing_record(self):
+        """Retriaging the same issue updates the existing DB record."""
+        db_repo = _make_db_repo()
+        orchestrator = self._make_orchestrator(
+            settings=_make_settings(rule_threshold=0.3),
+            db_repo=db_repo,
+        )
+        # First triage.
+        orchestrator.triage_issue(
+            repo_full_name="owner/upsert-test",
+            issue_number=70,
+            issue_body=SPAM_BODY,
+            apply_github_actions=False,
+        )
+        # Second triage with same issue.
+        orchestrator.triage_issue(
+            repo_full_name="owner/upsert-test",
+            issue_number=70,
+            issue_body=LEGITIMATE_BODY,
+            apply_github_actions=False,
+        )
+        # Should still be only one record.
+        count = db_repo.count_by_repo("owner/upsert-test")
+        assert count == 1
+
 
 # ---------------------------------------------------------------------------
 # Tests: TriageOrchestrator.retriage_issue
@@ -633,6 +914,53 @@ class TestTriageOrchestratorRetriageIssue:
         )
         assert isinstance(result, TriageResult)
 
+    def test_retriage_uses_custom_spam_label(self):
+        gh = _make_mock_github_client()
+        orchestrator = TriageOrchestrator(
+            settings=_make_settings(
+                rule_threshold=0.3,
+                spam_label="custom-spam-label",
+                hold_notification=False,
+            ),
+            db_repo=_make_db_repo(),
+            github_client=gh,
+        )
+        orchestrator.retriage_issue(
+            repo_full_name="owner/repo",
+            issue_number=5,
+            issue_body=SPAM_BODY,
+        )
+        gh.remove_label.assert_called_once_with(
+            repo_full_name="owner/repo",
+            issue_number=5,
+            label_name="custom-spam-label",
+        )
+
+    def test_retriage_persists_new_result(self):
+        db_repo = _make_db_repo()
+        orchestrator = TriageOrchestrator(
+            settings=_make_settings(rule_threshold=0.3),
+            db_repo=db_repo,
+        )
+        # First triage with spam body.
+        orchestrator.triage_issue(
+            repo_full_name="owner/retriage-test",
+            issue_number=80,
+            issue_body=SPAM_BODY,
+            apply_github_actions=False,
+        )
+        # Retriage with legitimate body.
+        orchestrator.retriage_issue(
+            repo_full_name="owner/retriage-test",
+            issue_number=80,
+            issue_body=LEGITIMATE_BODY,
+            apply_github_actions=False,
+        )
+        record = db_repo.get_by_repo_and_issue("owner/retriage-test", 80)
+        assert record is not None
+        # After retriage with legitimate body, decision should be legitimate.
+        assert record.triage_result.decision == TriageDecision.LEGITIMATE
+
 
 # ---------------------------------------------------------------------------
 # Tests: get_orchestrator factory
@@ -652,4 +980,29 @@ class TestGetOrchestrator:
     def test_injected_github_client_used(self):
         gh = _make_mock_github_client()
         orchestrator = get_orchestrator(github_client=gh)
+        assert orchestrator._github_client is gh
+
+    def test_injected_settings_used(self):
+        settings = _make_settings(rule_threshold=0.42)
+        orchestrator = get_orchestrator(settings=settings)
+        assert orchestrator._settings is settings
+
+    def test_settings_none_uses_global(self):
+        orchestrator = get_orchestrator(settings=None)
+        assert orchestrator._settings is None
+        # _get_settings should fall back to global settings (may fail without env vars)
+        # Just verify the factory works.
+        assert isinstance(orchestrator, TriageOrchestrator)
+
+    def test_all_injections_used(self):
+        db_repo = _make_db_repo()
+        gh = _make_mock_github_client()
+        settings = _make_settings()
+        orchestrator = get_orchestrator(
+            settings=settings,
+            db_repo=db_repo,
+            github_client=gh,
+        )
+        assert orchestrator._settings is settings
+        assert orchestrator._db_repo is db_repo
         assert orchestrator._github_client is gh

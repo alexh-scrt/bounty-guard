@@ -549,3 +549,115 @@ authenticated users via phishing links.
 """
         score = score_issue(body)
         assert score.total_score < 0.6, f"XSS report scored too high: {score}"
+
+    def test_deserialization_rce_report_scores_low(self):
+        """A detailed Java deserialization RCE report should score low."""
+        body = """
+## Java Deserialization RCE via /api/objects/deserialize
+
+The endpoint accepts a Base64-encoded Java serialized object without validation,
+enabling remote code execution via gadget chains (CWE-502).
+
+## Steps to Reproduce
+
+1. Generate payload with ysoserial:
+
+```bash
+java -jar ysoserial.jar CommonsCollections1 'id' | base64
+```
+
+2. Send the payload:
+
+```http
+POST /api/objects/deserialize HTTP/1.1
+Content-Type: application/json
+
+{"data": "<base64-payload>"}
+```
+
+3. Observe command output in the response.
+
+## Environment
+
+- Version: 3.1.2
+- JDK 11.0.20
+- Commons Collections 3.2.1
+
+## Impact
+
+Unauthenticated RCE as `www-data`.
+"""
+        score = score_issue(body)
+        assert score.total_score < 0.6, f"Deserialization report scored too high: {score}"
+
+    def test_no_code_no_repro_scores_high(self):
+        """A body with no code and no repro steps should score high."""
+        body = (
+            "There is a remote code execution vulnerability in the file upload feature. "
+            "An attacker can upload a malicious file and execute arbitrary commands. "
+            "This affects all users and should be patched immediately. "
+            "The vulnerability is triggered by uploading a specially crafted file. "
+            "An authenticated attacker can leverage this to gain full server access. " * 3
+        )
+        score = score_issue(body)
+        assert score.no_code_evidence is True
+        assert score.missing_reproduction_steps is True
+
+    def test_code_present_clears_no_code_evidence(self):
+        """Any code block should clear no_code_evidence regardless of other signals."""
+        body = (
+            "Vulnerability description here. " * 5
+            + "\n```python\nprint('hello')\n```\n"
+            + "x" * 100
+        )
+        score = score_issue(body)
+        assert score.no_code_evidence is False
+
+    def test_all_signals_individually_accessible(self):
+        """Verify all seven signal fields are present and boolean."""
+        score = score_issue(SPAM_REPORT_ALL_SIGNALS)
+        signal_fields = [
+            "vague_description",
+            "missing_reproduction_steps",
+            "cve_template_detected",
+            "no_code_evidence",
+            "excessive_severity_claims",
+            "generic_greeting",
+            "suspiciously_short",
+        ]
+        for field in signal_fields:
+            value = getattr(score, field)
+            assert isinstance(value, bool), f"Field {field} should be bool, got {type(value)}"
+
+    def test_fired_signals_subset_of_all_signals(self):
+        """fired_signals should only contain names of True boolean fields."""
+        score = score_issue(SPAM_REPORT_ALL_SIGNALS)
+        all_signal_names = {
+            "vague_description",
+            "missing_reproduction_steps",
+            "cve_template_detected",
+            "no_code_evidence",
+            "excessive_severity_claims",
+            "generic_greeting",
+            "suspiciously_short",
+        }
+        for name in score.fired_signals:
+            assert name in all_signal_names
+            assert getattr(score, name) is True
+
+    def test_score_consistent_with_fired_signals(self):
+        """total_score should equal signal_count / 7 for any body."""
+        test_bodies = [
+            LEGITIMATE_REPORT,
+            SPAM_REPORT_ALL_SIGNALS,
+            "",
+            None,
+            "Steps to reproduce:\n1. Do x\n\n```bash\ncurl example.com\n```\n" + "x" * 100,
+        ]
+        for body in test_bodies:
+            score = score_issue(body)
+            expected = score.signal_count / 7
+            assert score.total_score == pytest.approx(expected, abs=1e-5), (
+                f"Score mismatch for body={body!r[:30]}: "
+                f"total_score={score.total_score} signal_count={score.signal_count}"
+            )
